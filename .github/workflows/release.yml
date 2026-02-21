@@ -1,0 +1,54 @@
+name: Release Artifacts
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/safepipe dist/
+          tar -czf safepipe-${{ matrix.target }}.tar.gz -C dist safepipe
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/safepipe.exe dist/
+          Compress-Archive -Path dist/safepipe.exe -DestinationPath safepipe-${{ matrix.target }}.zip
+      - name: SHA256
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in safepipe-*.*; do shasum -a 256 "$f" > "$f.sha256"; done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            safepipe-*.*
+            safepipe-*.*.sha256
