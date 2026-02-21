@@ -1,0 +1,12 @@
+template v1
+
+source profile = file("profile.txt") | trim:both
+source prompt = stdin() | trim:both | wrap:width=30
+
+emit """
+[PROFILE]
+{{profile}}
+
+[PROMPT]
+{{prompt}}
+"""
