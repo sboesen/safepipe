@@ -186,6 +186,20 @@ pub enum Op {
         numeric: bool,
         reverse: bool,
     },
+    SelectColumns {
+        delimiter: String,
+        fields: Vec<u16>,
+        output_delimiter: Option<String>,
+        skip_missing: bool,
+    },
+    FilterContains {
+        needle: String,
+        invert: bool,
+    },
+    FilterRegex {
+        pattern: String,
+        invert: bool,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -254,6 +268,39 @@ pub fn validate_spec(spec: &PipelineSpec) -> Result<(), SpecError> {
                     )));
                 }
             }
+            Op::SelectColumns {
+                delimiter, fields, ..
+            } => {
+                if delimiter.is_empty() {
+                    return Err(SpecError::Invalid(format!(
+                        "ops[{idx}] select_columns.delimiter must be non-empty"
+                    )));
+                }
+                if fields.is_empty() {
+                    return Err(SpecError::Invalid(format!(
+                        "ops[{idx}] select_columns.fields must include at least one field index"
+                    )));
+                }
+                if fields.contains(&0) {
+                    return Err(SpecError::Invalid(format!(
+                        "ops[{idx}] select_columns.fields are 1-based and must be >= 1"
+                    )));
+                }
+            }
+            Op::FilterContains { needle, .. } => {
+                if needle.is_empty() {
+                    return Err(SpecError::Invalid(format!(
+                        "ops[{idx}] filter_contains.needle must be non-empty"
+                    )));
+                }
+            }
+            Op::FilterRegex { pattern, .. } => {
+                Regex::new(pattern).map_err(|e| {
+                    SpecError::Invalid(format!(
+                        "ops[{idx}] filter_regex.pattern failed to compile: {e}"
+                    ))
+                })?;
+            }
             Op::NormalizeUnicode { .. }
             | Op::Trim { .. }
             | Op::CollapseWhitespace { .. }
@@ -289,6 +336,20 @@ mod tests {
                 pattern: "(".to_string(),
                 to: "x".to_string(),
                 max_replacements: None,
+            }],
+            ..PipelineSpec::default()
+        };
+        assert!(validate_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_select_columns_fields() {
+        let spec = PipelineSpec {
+            ops: vec![Op::SelectColumns {
+                delimiter: "whitespace".to_string(),
+                fields: vec![0],
+                output_delimiter: None,
+                skip_missing: false,
             }],
             ..PipelineSpec::default()
         };

@@ -204,3 +204,26 @@ hello
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("set directives are not allowed"));
 }
+
+#[test]
+fn safe_awk_like_select_and_filter_ops_work() {
+    let output = run_safepipe(
+        &[
+            "run",
+            "--op",
+            "select_columns:fields=1|3,delimiter=whitespace,output_delimiter=|",
+            "--op",
+            "filter_contains:needle=ops",
+        ],
+        b"alice 10 dev\nbob 20 ops\ncharlie 30 ops\n",
+    );
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "bob|ops\ncharlie|ops\n"
+    );
+}

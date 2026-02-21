@@ -1,0 +1,8 @@
+template v1
+
+source rows = file("app.log") | filter_contains:needle=ERROR | select_columns:fields=1;3;4,delimiter=whitespace,output_delimiter=:
+
+emit """
+Filtered error rows (field1:field3:field4):
+{{rows}}
+"""

@@ -194,6 +194,20 @@ fn apply_op(input: String, op: &Op) -> Result<String, EngineError> {
             numeric,
             reverse,
         } => Ok(sort_lines(&input, *unique, *numeric, *reverse)),
+        Op::SelectColumns {
+            delimiter,
+            fields,
+            output_delimiter,
+            skip_missing,
+        } => Ok(select_columns(
+            &input,
+            delimiter,
+            fields,
+            output_delimiter.as_deref(),
+            *skip_missing,
+        )),
+        Op::FilterContains { needle, invert } => Ok(filter_contains(&input, needle, *invert)),
+        Op::FilterRegex { pattern, invert } => Ok(filter_regex(&input, pattern, *invert)?),
     }
 }
 
@@ -449,6 +463,93 @@ fn compare_numeric_lines(a: &str, b: &str) -> Ordering {
     }
 }
 
+fn select_columns(
+    input: &str,
+    delimiter: &str,
+    fields: &[u16],
+    output_delimiter: Option<&str>,
+    skip_missing: bool,
+) -> String {
+    let had_trailing_newline = input.ends_with('\n');
+    let normalized = normalize_delimiter(delimiter);
+    let out_delim = match (output_delimiter, normalized) {
+        (Some(explicit), _) => explicit,
+        (None, None) => " ",
+        (None, Some(delim)) => delim,
+    };
+
+    let mut out_lines = Vec::new();
+    for line in input.lines() {
+        let columns = split_columns(line, delimiter);
+        let mut selected = Vec::with_capacity(fields.len());
+        for field in fields {
+            let idx = (*field as usize).saturating_sub(1);
+            if let Some(value) = columns.get(idx) {
+                selected.push((*value).to_string());
+            } else if !skip_missing {
+                selected.push(String::new());
+            }
+        }
+        out_lines.push(selected.join(out_delim));
+    }
+
+    let mut out = out_lines.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
+fn filter_contains(input: &str, needle: &str, invert: bool) -> String {
+    let had_trailing_newline = input.ends_with('\n');
+    let mut kept = Vec::new();
+    for line in input.lines() {
+        let contains = line.contains(needle);
+        if contains ^ invert {
+            kept.push(line.to_string());
+        }
+    }
+
+    let mut out = kept.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    out
+}
+
+fn filter_regex(input: &str, pattern: &str, invert: bool) -> Result<String, EngineError> {
+    let had_trailing_newline = input.ends_with('\n');
+    let re = Regex::new(pattern)?;
+    let mut kept = Vec::new();
+    for line in input.lines() {
+        let matches = re.is_match(line);
+        if matches ^ invert {
+            kept.push(line.to_string());
+        }
+    }
+
+    let mut out = kept.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn split_columns<'a>(line: &'a str, delimiter: &str) -> Vec<&'a str> {
+    match normalize_delimiter(delimiter) {
+        None => line.split_whitespace().collect(),
+        Some(delim) => line.split(delim).collect(),
+    }
+}
+
+fn normalize_delimiter(delimiter: &str) -> Option<&str> {
+    match delimiter {
+        "whitespace" => None,
+        "\\t" => Some("\t"),
+        other => Some(other),
+    }
+}
+
 fn redact_regex(pattern: &RedactPattern) -> &'static Regex {
     static EMAIL: OnceLock<Regex> = OnceLock::new();
     static IPV4: OnceLock<Regex> = OnceLock::new();
@@ -672,5 +773,45 @@ mod tests {
             let result = run_pipeline(&input, &spec, &limits);
             assert!(result.is_ok());
         }
+    }
+
+    #[test]
+    fn select_columns_whitespace_behaves_like_safe_awk_fields() {
+        let mut spec = spec_with_policy(TerminalPolicy::Raw);
+        spec.ops.push(Op::SelectColumns {
+            delimiter: "whitespace".to_string(),
+            fields: vec![1, 3],
+            output_delimiter: Some("|".to_string()),
+            skip_missing: true,
+        });
+
+        let out = run_pipeline(
+            b"alice 10 dev\nbob 20 ops\n",
+            &spec,
+            &EngineLimits::default(),
+        )
+        .expect("pipeline should succeed");
+        assert_eq!(out, "alice|dev\nbob|ops\n");
+    }
+
+    #[test]
+    fn filter_contains_and_filter_regex_chain() {
+        let mut spec = spec_with_policy(TerminalPolicy::Raw);
+        spec.ops.push(Op::FilterContains {
+            needle: "ERROR".to_string(),
+            invert: false,
+        });
+        spec.ops.push(Op::FilterRegex {
+            pattern: r"timeout|quota".to_string(),
+            invert: false,
+        });
+
+        let out = run_pipeline(
+            b"INFO startup\nERROR timeout reached\nERROR bad password\nERROR quota exceeded\n",
+            &spec,
+            &EngineLimits::default(),
+        )
+        .expect("pipeline should succeed");
+        assert_eq!(out, "ERROR timeout reached\nERROR quota exceeded\n");
     }
 }

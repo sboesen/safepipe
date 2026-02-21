@@ -1,89 +1,33 @@
 # safepipe
 
-`safepipe` is a local-first Rust CLI for running untrusted text templates safely.
+Safe, local-first text/template runtime for agents.
 
-Primary goal: trust one binary, then share templates (`.spt`) from GitHub or files without giving templates control over runtime safety policy.
+Core model: trust one binary, treat templates as untrusted data, force runtime safety policy at execution flags.
 
-## Agent-Oriented Safety Properties
-
-These are implemented design properties, not formal proofs:
-
-- No shell execution, no eval, no dynamic plugin loading.
-- Templates are declarative text only.
-- Template scripts cannot set terminal safety policy.
-- Caller must choose safety policy at runtime via CLI flag.
-- `file("...")` reads are constrained under `--root`.
-- Output passes terminal sanitization unless `--terminal-policy raw` is explicitly chosen.
-- Input/output/template/source sizes are bounded by limits.
-
-## Install
+## LLM Quickstart
 
 ```bash
+# install
 cargo install --path crates/cli
-```
 
-## Template DSL (Untrusted Input)
-
-Template syntax (`v1`):
-
-- `template v1`
-- `source <name> = file("...") | <op> | <op> ...`
-- `source <name> = stdin() | <op> ...`
-- `source <name> = now("%Y-%m-%d %H:%M:%S %Z")`
-- `source <name> = literal("...")`
-- `emit """ ... {{name}} ... """`
-
-`set ...` directives are rejected.
-
-Example template:
-
-```text
-template v1
-
-source now = now("%Y-%m-%d %H:%M:%S %Z")
-source profile = file("profile.txt") | trim:both
-source prompt = stdin() | trim:both | wrap:width=88
-
-emit """
-Current time: {{now}}
-
-Profile:
-{{profile}}
-
-User prompt:
-{{prompt}}
-"""
-```
-
-Run with explicit runtime safety policy:
-
-```bash
-cat user.txt | safepipe template run \
-  --template ./template.spt \
-  --root . \
-  --terminal-policy strict_printable
-```
-
-## Sharing and Installation
-
-```bash
-# Install from URL
-safepipe template install \
-  --name daily_context \
-  --from https://raw.githubusercontent.com/ORG/REPO/main/templates/daily_context.spt
-
-# List installed
-safepipe template list
-
-# Show installed template source
-safepipe template show --name daily_context
-
-# Run installed template
+# run untrusted template with explicit safety policy
 cat input.txt | safepipe template run \
-  --template @daily_context \
+  --template https://raw.githubusercontent.com/ORG/REPO/main/template.spt \
   --root . \
   --terminal-policy strict_printable
 ```
+
+## Security Properties (Implemented, Not Formal Proof)
+
+- no shell exec
+- no eval
+- no plugin loading
+- template cannot set runtime terminal policy
+- caller must pass `--terminal-policy` for `template run`
+- `file("...")` reads are constrained to `--root` (path escape blocked)
+- bounds on template/source/output sizes and line count
+
+See `SECURITY.md` for threat model and limitations.
 
 ## Commands
 
@@ -95,11 +39,67 @@ cat input.txt | safepipe template run \
 - `safepipe template list`
 - `safepipe template show --name ...`
 
-## Terminal Policies
+## Template DSL (v1)
 
-- `strict_printable`: strips/escapes all control sequences.
-- `balanced`: allows safe SGR styles, strips dangerous control/OSC sequences.
-- `raw`: no sanitizer (explicit opt-in).
+Supported lines:
+
+- `template v1`
+- `source <name> = file("...") | <op>...`
+- `source <name> = stdin() | <op>...`
+- `source <name> = now("...")`
+- `source <name> = literal("...")`
+- `emit """ ... {{name}} ... """`
+
+Rejected by design:
+
+- `set ...` directives
+
+## Safe awk-like subset
+
+New awk-style declarative ops:
+
+- `select_columns`
+- `filter_contains`
+- `filter_regex`
+
+Example direct usage:
+
+```bash
+cat app.log | safepipe run \
+  --op 'filter_contains:needle=ERROR' \
+  --op 'select_columns:fields=1;3;4,delimiter=whitespace,output_delimiter=|'
+```
+
+Equivalent template usage:
+
+```text
+template v1
+source rows = file("app.log") | filter_contains:needle=ERROR | select_columns:fields=1;3;4,delimiter=whitespace,output_delimiter=:
+emit """
+{{rows}}
+"""
+```
+
+## Dense LLM Reference
+
+Use this for compact, machine-friendly docs:
+
+- `docs/LLM_DSL_REFERENCE.md`
+
+It includes:
+
+- grammar
+- op syntax
+- dense examples
+- failure hints
+- safe agent execution pattern
+
+## Runnable Examples
+
+- `examples/run_file_and_stdin_demo.sh`
+- `examples/run_system_context_demo.sh`
+- `examples/run_stdin_prompt_demo.sh`
+- `examples/run_safe_awk_extract_demo.sh`
 
 ## Exit Codes
 
@@ -107,10 +107,3 @@ cat input.txt | safepipe template run \
 - `2`: spec/template/validation error
 - `3`: limits exceeded or timeout
 - `4`: internal/runtime error
-
-## Examples
-
-- `examples/system_context.spt`
-- `examples/stdin_prompt.spt`
-
-See `SECURITY.md` for threat model and boundaries.

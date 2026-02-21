@@ -790,6 +790,59 @@ fn parse_op_expr(expr: &str) -> Result<Op, CliError> {
                 reverse,
             })
         }
+        "select_columns" | "select_fields" | "awk_select" => {
+            let fields_raw = get_value(&kv, &positional, &["fields"], 0).ok_or_else(|| {
+                CliError::OpParse(
+                    "select_columns requires fields (e.g. fields=1;3 or positional 1;3)"
+                        .to_string(),
+                )
+            })?;
+            let delimiter = get_value(&kv, &positional, &["delimiter", "delim"], 1)
+                .unwrap_or_else(|| "whitespace".to_string());
+            let output_delimiter = get_value(
+                &kv,
+                &positional,
+                &["output_delimiter", "out_delimiter", "out"],
+                2,
+            );
+            let skip_missing = get_value(&kv, &positional, &["skip_missing"], 3)
+                .map(|v| parse_bool(&v))
+                .transpose()?
+                .unwrap_or(true);
+
+            Ok(Op::SelectColumns {
+                delimiter: parse_column_delimiter(&delimiter)?,
+                fields: parse_fields_list(&fields_raw)?,
+                output_delimiter,
+                skip_missing,
+            })
+        }
+        "filter_contains" => {
+            let needle = get_value(&kv, &positional, &["needle"], 0).ok_or_else(|| {
+                CliError::OpParse(
+                    "filter_contains requires needle (e.g. filter_contains:needle=ERROR)"
+                        .to_string(),
+                )
+            })?;
+            let invert = get_value(&kv, &positional, &["invert"], 1)
+                .map(|v| parse_bool(&v))
+                .transpose()?
+                .unwrap_or(false);
+            Ok(Op::FilterContains { needle, invert })
+        }
+        "filter_regex" => {
+            let pattern = get_value(&kv, &positional, &["pattern"], 0).ok_or_else(|| {
+                CliError::OpParse(
+                    "filter_regex requires pattern (e.g. filter_regex:pattern=timeout|quota)"
+                        .to_string(),
+                )
+            })?;
+            let invert = get_value(&kv, &positional, &["invert"], 1)
+                .map(|v| parse_bool(&v))
+                .transpose()?
+                .unwrap_or(false);
+            Ok(Op::FilterRegex { pattern, invert })
+        }
         _ => Err(CliError::OpParse(format!("unknown op '{name_raw}'"))),
     }
 }
@@ -934,4 +987,36 @@ fn parse_redact_patterns(raw: &str) -> Result<Vec<RedactPattern>, CliError> {
     }
 
     Ok(patterns)
+}
+
+fn parse_fields_list(raw: &str) -> Result<Vec<u16>, CliError> {
+    let fields: Result<Vec<_>, _> = raw
+        .split(['|', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| parse_u16(s, "select_columns.fields"))
+        .collect();
+    let fields = fields?;
+    if fields.is_empty() {
+        return Err(CliError::OpParse(
+            "select_columns.fields must include at least one field index".to_string(),
+        ));
+    }
+    if fields.contains(&0) {
+        return Err(CliError::OpParse(
+            "select_columns fields are 1-based and must be >= 1".to_string(),
+        ));
+    }
+    Ok(fields)
+}
+
+fn parse_column_delimiter(raw: &str) -> Result<String, CliError> {
+    match normalize_key(raw).as_str() {
+        "space" | "spaces" | "whitespace" => Ok("whitespace".to_string()),
+        "tab" => Ok("\\t".to_string()),
+        "" => Err(CliError::OpParse(
+            "select_columns delimiter cannot be empty".to_string(),
+        )),
+        _ => Ok(raw.to_string()),
+    }
 }
