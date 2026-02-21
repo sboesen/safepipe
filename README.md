@@ -54,6 +54,19 @@ Two interfaces are supported in v1:
 - Repeated `--op` mini expressions.
 - JSON spec via `--spec` (inline JSON or `@path/to/spec.json`).
 
+`--op` mini expressions use:
+
+- `name:key=value,key2=value2`
+- or positional form `name:value1,value2`
+
+Examples:
+
+```bash
+safepipe run --op trim:both
+safepipe run --op wrap:width=80,break_long_words=false
+safepipe run --op redact:patterns=email|ipv4,replacement=[REDACTED]
+```
+
 Example JSON spec:
 
 ```json
