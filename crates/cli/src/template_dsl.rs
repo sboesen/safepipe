@@ -27,6 +27,7 @@ pub enum SourceKind {
     Stdin,
     Now(String),
     Literal(String),
+    Command(String),
 }
 
 pub fn parse_template(input: &str) -> Result<TemplateScript, String> {
@@ -121,6 +122,13 @@ fn parse_source_kind(input: &str) -> Result<SourceKind, String> {
         "file" => Ok(SourceKind::File(parse_json_string_arg(args)?)),
         "now" => Ok(SourceKind::Now(parse_json_string_arg(args)?)),
         "literal" => Ok(SourceKind::Literal(parse_json_string_arg(args)?)),
+        "command" | "cmd" => {
+            let name = parse_json_string_arg(args)?;
+            if name.trim().is_empty() {
+                return Err("command() requires non-empty command name".to_string());
+            }
+            Ok(SourceKind::Command(name))
+        }
         other => Err(format!("unsupported source function '{other}'")),
     }
 }
@@ -219,5 +227,22 @@ hello
         "#;
         let err = parse_template(tpl).expect_err("template should fail");
         assert!(err.contains("set directives are not allowed"));
+    }
+
+    #[test]
+    fn parses_command_source() {
+        let tpl = r#"
+template v1
+source now = command("date_utc")
+emit """
+{{now}}
+"""
+        "#;
+        let parsed = parse_template(tpl).expect("template should parse");
+        assert_eq!(parsed.sources.len(), 1);
+        assert!(matches!(
+            parsed.sources[0].kind,
+            SourceKind::Command(ref name) if name == "date_utc"
+        ));
     }
 }

@@ -88,6 +88,24 @@ fn untrusted_spec_cannot_force_raw_terminal_policy() {
 }
 
 #[test]
+fn raw_policy_name_is_explicitly_dangerous() {
+    let output = run_safepipe(&["run", "--terminal-policy", "raw"], b"safe");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dangerously_allow_raw"));
+}
+
+#[test]
+fn dangerously_allow_raw_policy_passes_escape_sequences() {
+    let output = run_safepipe(
+        &["run", "--terminal-policy", "dangerously_allow_raw"],
+        b"\x1b[2Jsafe",
+    );
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "\u{1b}[2Jsafe");
+}
+
+#[test]
 fn template_run_reads_file_and_renders_body() {
     let dir = tempdir().expect("tempdir should be created");
     let template_path = dir.path().join("example.spt");
@@ -331,16 +349,16 @@ emit """
 }
 
 #[test]
-fn template_sha256_mismatch_fails_closed() {
+fn template_command_requires_allow_command() {
     let dir = tempdir().expect("tempdir should be created");
-    let template_path = dir.path().join("example.spt");
+    let template_path = dir.path().join("cmd.spt");
     std::fs::write(
         &template_path,
         r#"
 template v1
-source name = literal("agent")
+source now = command("date_utc")
 emit """
-{{name}}
+{{now}}
 """
 "#,
     )
@@ -356,17 +374,135 @@ emit """
             dir.path().to_str().expect("valid path"),
             "--terminal-policy",
             "strict_printable",
-            "--template-sha256",
-            "0000000000000000000000000000000000000000000000000000000000000000",
         ],
         b"",
         Some(dir.path()),
         &[],
     );
-
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("template SHA-256 mismatch"));
+    assert!(stderr.contains("blocked; pass --allow-command"));
+}
+
+#[test]
+fn template_command_runs_when_allowed() {
+    let dir = tempdir().expect("tempdir should be created");
+    let template_path = dir.path().join("cmd.spt");
+    std::fs::write(
+        &template_path,
+        r#"
+template v1
+source now = command("unix_time")
+emit """
+{{now}}
+"""
+"#,
+    )
+    .expect("should write template file");
+
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            template_path.to_str().expect("valid path"),
+            "--root",
+            dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+            "--allow-command",
+            "unix_time",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(!stdout.is_empty());
+    assert!(stdout.chars().all(|c| c.is_ascii_digit()));
+}
+
+#[test]
+fn unknown_allow_command_is_rejected() {
+    let dir = tempdir().expect("tempdir should be created");
+    let template_path = dir.path().join("cmd.spt");
+    std::fs::write(
+        &template_path,
+        r#"
+template v1
+source now = command("date_utc")
+emit """
+{{now}}
+"""
+"#,
+    )
+    .expect("should write template file");
+
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            template_path.to_str().expect("valid path"),
+            "--root",
+            dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+            "--allow-command",
+            "whoami",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown trusted command"));
+}
+
+#[test]
+fn template_run_rejects_remote_urls() {
+    let dir = tempdir().expect("tempdir should be created");
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            "https://example.com/template.spt",
+            "--root",
+            dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("remote template URLs are disabled"));
+}
+
+#[test]
+fn template_install_rejects_remote_urls() {
+    let dir = tempdir().expect("tempdir should be created");
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "install",
+            "--name",
+            "demo",
+            "--from",
+            "https://example.com/template.spt",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("remote template URLs are disabled"));
 }
 
 #[test]

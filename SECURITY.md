@@ -2,7 +2,7 @@
 
 ## Scope
 
-`safepipe` is for safe local processing of untrusted text, including remotely hosted template files.
+`safepipe` is for safe local processing of untrusted text from stdin and local template files.
 
 ## Important Note
 
@@ -31,19 +31,18 @@ Non-goals:
 - Declarative template and transform model (no executable user code).
 - No subprocess execution in runtime pipeline.
 - `run` mode terminal policy is caller-controlled; untrusted spec policy is ignored.
-- URL templates are fetched as text only, then parsed by DSL parser.
-- URL defaults are hardened: HTTPS-only, redirects blocked, private/local hosts blocked unless explicit override.
-- Optional template integrity pin with `--template-sha256`.
+- No in-process network template fetching; URL template sources are rejected.
 - Template `set ...` directives are rejected.
 - Runtime safety policy is caller-selected via CLI flags.
 - `file("...")` is rooted under `--root`, path escape is blocked, and optional `--allow-read` can narrow capabilities.
+- `command("...")` supports only built-in trusted in-process commands and requires caller allowlist via `--allow-command`.
 - Source/template/output size limits are enforced.
 
 ## Output Safety Modes
 
 - `balanced` (default in direct run mode): allows safe SGR styling, strips dangerous control sequences.
 - `strict_printable`: strips/escapes all control sequences.
-- `raw`: disables sanitizer (explicit opt-in).
+- `dangerously_allow_raw`: disables sanitizer (explicit opt-in).
 
 ## Reporting
 

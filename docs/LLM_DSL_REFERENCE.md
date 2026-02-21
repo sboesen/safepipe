@@ -242,12 +242,13 @@ Sanitized:
 """
 ```
 
-### E) remote template distribution
+### E) template install (local file only)
 
 ```bash
+# fetch/store template outside safepipe, then install locally
 safepipe template install \
   --name daily_context \
-  --from https://raw.githubusercontent.com/ORG/REPO/main/templates/daily_context.spt
+  --from ./daily_context.spt
 
 cat input.txt \
 | safepipe template run \
