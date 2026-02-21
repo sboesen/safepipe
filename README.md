@@ -1,14 +1,20 @@
 # safepipe
 
-`safepipe` is a local-first, memory-safe CLI for safe text pipelines and shareable prompt templates.
+`safepipe` is a local-first Rust CLI for running untrusted text templates safely.
 
-Primary workflow:
+Primary goal: trust one binary, then share templates (`.spt`) from GitHub or files without giving templates control over runtime safety policy.
 
-1. Trust one binary (`safepipe`).
-2. Share template files (`.spt`) from GitHub or local files.
-3. Let templates read local data in a constrained way and render terminal output safely.
+## Agent-Oriented Safety Properties
 
-The runtime does not execute shell commands, does not load plugins, and does not eval user code.
+These are implemented design properties, not formal proofs:
+
+- No shell execution, no eval, no dynamic plugin loading.
+- Templates are declarative text only.
+- Template scripts cannot set terminal safety policy.
+- Caller must choose safety policy at runtime via CLI flag.
+- `file("...")` reads are constrained under `--root`.
+- Output passes terminal sanitization unless `--terminal-policy raw` is explicitly chosen.
+- Input/output/template/source sizes are bounded by limits.
 
 ## Install
 
@@ -16,27 +22,23 @@ The runtime does not execute shell commands, does not load plugins, and does not
 cargo install --path crates/cli
 ```
 
-## Template DSL (Primary Use Case)
+## Template DSL (Untrusted Input)
 
-A template can be local, installed, or fetched from a URL.
-
-Template syntax (v1):
+Template syntax (`v1`):
 
 - `template v1`
-- `set terminal_policy = balanced|strict_printable|raw`
-- `set newline = preserve|ensure_trailing`
 - `source <name> = file("...") | <op> | <op> ...`
 - `source <name> = stdin() | <op> ...`
 - `source <name> = now("%Y-%m-%d %H:%M:%S %Z")`
 - `source <name> = literal("...")`
 - `emit """ ... {{name}} ... """`
 
-Example:
+`set ...` directives are rejected.
+
+Example template:
 
 ```text
 template v1
-set terminal_policy = balanced
-set newline = ensure_trailing
 
 source now = now("%Y-%m-%d %H:%M:%S %Z")
 source profile = file("profile.txt") | trim:both
@@ -53,57 +55,51 @@ User prompt:
 """
 ```
 
-Run it:
+Run with explicit runtime safety policy:
 
 ```bash
-cat user.txt | safepipe template run --template ./template.spt --root .
+cat user.txt | safepipe template run \
+  --template ./template.spt \
+  --root . \
+  --terminal-policy strict_printable
 ```
 
-### Sharing / Installing templates
+## Sharing and Installation
 
 ```bash
-# Install from GitHub raw URL
+# Install from URL
 safepipe template install \
   --name daily_context \
   --from https://raw.githubusercontent.com/ORG/REPO/main/templates/daily_context.spt
 
-# List installed templates
+# List installed
 safepipe template list
 
-# Show installed template
+# Show installed template source
 safepipe template show --name daily_context
 
 # Run installed template
-cat input.txt | safepipe template run --template @daily_context --root .
+cat input.txt | safepipe template run \
+  --template @daily_context \
+  --root . \
+  --terminal-policy strict_printable
 ```
-
-## Transform Mode (Direct)
-
-You can still run direct transforms without templates:
-
-```bash
-cat notes.txt | safepipe run --op trim:both --op collapse_whitespace:preserve_newlines=true
-```
-
-Supported interfaces:
-
-- repeated `--op` expressions
-- JSON `--spec` (inline or `@file`)
 
 ## Commands
 
 - `safepipe run`
 - `safepipe validate --spec ...`
 - `safepipe explain --spec ...`
-- `safepipe template run --template ... --root ...`
+- `safepipe template run --template ... --root ... --terminal-policy ...`
 - `safepipe template install --name ... --from ...`
 - `safepipe template list`
 - `safepipe template show --name ...`
 
-## Example Templates
+## Terminal Policies
 
-- `examples/system_context.spt`
-- `examples/stdin_prompt.spt`
+- `strict_printable`: strips/escapes all control sequences.
+- `balanced`: allows safe SGR styles, strips dangerous control/OSC sequences.
+- `raw`: no sanitizer (explicit opt-in).
 
 ## Exit Codes
 
@@ -112,12 +108,9 @@ Supported interfaces:
 - `3`: limits exceeded or timeout
 - `4`: internal/runtime error
 
-## Safety Notes
+## Examples
 
-- No shell execution, eval, or dynamic extension loading.
-- Template `file(...)` reads are rooted by `--root` and must remain under that directory.
-- URL templates are treated as untrusted text and parsed declaratively.
-- Terminal sanitizer is applied unless output policy is `raw`.
-- Resource bounds: template bytes, source bytes, output bytes, line count, optional timeout.
+- `examples/system_context.spt`
+- `examples/stdin_prompt.spt`
 
-For details, see `SECURITY.md`.
+See `SECURITY.md` for threat model and boundaries.

@@ -97,6 +97,8 @@ Hello {{profile}}
             template_path.to_str().expect("valid path"),
             "--root",
             dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
         ],
         b"",
         Some(dir.path()),
@@ -164,4 +166,41 @@ emit """
     );
     let shown = String::from_utf8_lossy(&show.stdout);
     assert!(shown.contains("source name = literal(\"agent\")"));
+}
+
+#[test]
+fn template_rejects_set_directive() {
+    let dir = tempdir().expect("tempdir should be created");
+    let template_path = dir.path().join("bad.spt");
+    std::fs::write(
+        &template_path,
+        r#"
+template v1
+set terminal_policy = raw
+emit """
+hello
+"""
+"#,
+    )
+    .expect("should write bad template");
+
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            template_path.to_str().expect("valid path"),
+            "--root",
+            dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("set directives are not allowed"));
 }

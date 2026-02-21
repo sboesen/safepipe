@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use template_dsl::{SourceKind, TemplateScript};
+use template_dsl::SourceKind;
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -112,8 +112,20 @@ struct TemplateRunCommand {
     #[arg(long, help = "Optional timeout in milliseconds")]
     timeout_ms: Option<u64>,
 
-    #[arg(long, value_enum, help = "Optional final terminal policy override")]
-    terminal_policy: Option<TerminalPolicyArg>,
+    #[arg(
+        long,
+        value_enum,
+        help = "Terminal safety policy (required for untrusted templates)"
+    )]
+    terminal_policy: TerminalPolicyArg,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = NewlineModeArg::Preserve,
+        help = "Newline mode applied after render"
+    )]
+    newline: NewlineModeArg,
 }
 
 #[derive(Debug, Parser)]
@@ -148,6 +160,22 @@ impl From<TerminalPolicyArg> for TerminalPolicy {
             TerminalPolicyArg::Balanced => TerminalPolicy::Balanced,
             TerminalPolicyArg::StrictPrintable => TerminalPolicy::StrictPrintable,
             TerminalPolicyArg::Raw => TerminalPolicy::Raw,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum NewlineModeArg {
+    Preserve,
+    EnsureTrailing,
+}
+
+impl From<NewlineModeArg> for NewlineMode {
+    fn from(value: NewlineModeArg) -> Self {
+        match value {
+            NewlineModeArg::Preserve => NewlineMode::Preserve,
+            NewlineModeArg::EnsureTrailing => NewlineMode::EnsureTrailing,
         }
     }
 }
@@ -316,8 +344,8 @@ fn template_run_command(cmd: TemplateRunCommand) -> Result<(), CliError> {
     let rendered = template_dsl::render_body(&script.body, &vars).map_err(CliError::Template)?;
     let final_output = render_template_output(
         rendered.as_bytes(),
-        &script,
-        cmd.terminal_policy.map(Into::into),
+        cmd.terminal_policy.into(),
+        cmd.newline.into(),
         &limits,
     )?;
 
@@ -329,23 +357,10 @@ fn template_run_command(cmd: TemplateRunCommand) -> Result<(), CliError> {
 
 fn render_template_output(
     rendered: &[u8],
-    script: &TemplateScript,
-    terminal_override: Option<TerminalPolicy>,
+    terminal_policy: TerminalPolicy,
+    newline: NewlineMode,
     limits: &EngineLimits,
 ) -> Result<String, CliError> {
-    let terminal_policy = match terminal_override {
-        Some(policy) => policy,
-        None => match script.terminal_policy.as_deref() {
-            Some(raw) => parse_terminal_policy_literal(raw)?,
-            None => TerminalPolicy::Balanced,
-        },
-    };
-
-    let newline = match script.newline.as_deref() {
-        Some(raw) => parse_newline_mode_literal(raw)?,
-        None => NewlineMode::Preserve,
-    };
-
     let final_spec = PipelineSpec {
         input: InputOptions {
             encoding: InputEncoding::BytesLossy,
@@ -561,25 +576,6 @@ fn read_to_end_limited<R: Read>(
     }
 
     Ok(out)
-}
-
-fn parse_terminal_policy_literal(raw: &str) -> Result<TerminalPolicy, CliError> {
-    match normalize_key(raw).as_str() {
-        "balanced" => Ok(TerminalPolicy::Balanced),
-        "strict_printable" => Ok(TerminalPolicy::StrictPrintable),
-        "raw" => Ok(TerminalPolicy::Raw),
-        _ => Err(CliError::Template(format!(
-            "invalid terminal_policy '{raw}'"
-        ))),
-    }
-}
-
-fn parse_newline_mode_literal(raw: &str) -> Result<NewlineMode, CliError> {
-    match normalize_key(raw).as_str() {
-        "preserve" => Ok(NewlineMode::Preserve),
-        "ensure_trailing" => Ok(NewlineMode::EnsureTrailing),
-        _ => Err(CliError::Template(format!("invalid newline mode '{raw}'"))),
-    }
 }
 
 fn load_base_spec(spec_arg: Option<&str>) -> Result<PipelineSpec, CliError> {

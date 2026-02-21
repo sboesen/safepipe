@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct TemplateScript {
-    pub terminal_policy: Option<String>,
-    pub newline: Option<String>,
     pub sources: Vec<SourceDecl>,
     pub body: String,
 }
@@ -35,8 +33,6 @@ pub fn parse_template(input: &str) -> Result<TemplateScript, String> {
     let lines: Vec<&str> = input.lines().collect();
     let mut idx = 0usize;
 
-    let mut terminal_policy = None;
-    let mut newline = None;
     let mut sources = Vec::new();
     let mut saw_emit = false;
 
@@ -53,17 +49,9 @@ pub fn parse_template(input: &str) -> Result<TemplateScript, String> {
         }
 
         if let Some(rest) = line.strip_prefix("set ") {
-            let (key, value) = rest
-                .split_once('=')
-                .ok_or_else(|| format!("invalid set directive: '{line}'"))?;
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "terminal_policy" => terminal_policy = Some(value.to_string()),
-                "newline" => newline = Some(value.to_string()),
-                _ => return Err(format!("unknown set key '{key}'")),
-            }
-            continue;
+            return Err(format!(
+                "set directives are not allowed in templates (found '{rest}'); use CLI flags like --terminal-policy instead"
+            ));
         }
 
         if line == "emit \"\"\"" {
@@ -108,12 +96,7 @@ pub fn parse_template(input: &str) -> Result<TemplateScript, String> {
         idx += 1;
         if line.trim() == "\"\"\"" {
             let body = body_lines.join("\n");
-            return Ok(TemplateScript {
-                terminal_policy,
-                newline,
-                sources,
-                body,
-            });
+            return Ok(TemplateScript { sources, body });
         }
         body_lines.push(line.to_string());
     }
@@ -223,5 +206,18 @@ hello {{who}}
         vars.insert("name".to_string(), "Alice".to_string());
         let out = render_body("hi {{name}}", &vars).expect("should render");
         assert_eq!(out, "hi Alice");
+    }
+
+    #[test]
+    fn rejects_set_directive() {
+        let tpl = r#"
+template v1
+set terminal_policy = raw
+emit """
+hello
+"""
+        "#;
+        let err = parse_template(tpl).expect_err("template should fail");
+        assert!(err.contains("set directives are not allowed"));
     }
 }

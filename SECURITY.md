@@ -1,41 +1,44 @@
 # Security Policy
 
-## Threat Model
+## Scope
 
-`safepipe` is intended for safe local processing of untrusted text, including remotely hosted template files.
+`safepipe` is for safe local processing of untrusted text, including remotely hosted template files.
+
+## Important Note
+
+This document describes intended security properties and implemented safeguards.
+It is not a formal proof or legal guarantee.
+
+## Threat Model
 
 Security objectives:
 
 - No remote code execution path from template/input text.
-- No shell-out/eval/plugin loading from runtime specs/templates.
+- No shell-out/eval/plugin loading from runtime templates/specs.
 - Prevent unsafe terminal control payloads from reaching stdout by default.
-- Bound CPU/memory impact via explicit limits.
+- Bound CPU/memory usage via explicit limits.
 - Constrain template local file reads under an explicit root directory.
 
 Non-goals:
 
 - Sandboxing other programs.
-- Deep semantic malware detection.
 - Perfect data-loss prevention.
+- Formal verification of the full runtime.
 
-## Hardening Guarantees
+## Implemented Safeguards
 
 - Rust implementation (memory-safe by default).
-- Declarative transform set (no user-defined executable code).
-- Regex engine is Rust `regex` (non-backtracking engine class).
+- Declarative template and transform model (no executable user code).
 - No subprocess execution in runtime pipeline.
-- URL templates are fetched as data only, then parsed by DSL parser.
-
-## Template Security Model
-
-- `template run --template <url|path|@name>` loads text templates only.
-- `file("...")` reads are relative to `--root` and blocked if they escape root.
-- Source, template, and output sizes are bounded by CLI limits.
-- Remote template content must be UTF-8 and within max byte limits.
+- URL templates are fetched as text only, then parsed by DSL parser.
+- Template `set ...` directives are rejected.
+- Runtime safety policy is caller-selected via CLI flags.
+- `file("...")` is rooted under `--root` and path escape is blocked.
+- Source/template/output size limits are enforced.
 
 ## Output Safety Modes
 
-- `balanced` (default): allows safe SGR styling, strips dangerous escape/control sequences.
+- `balanced` (default in direct run mode): allows safe SGR styling, strips dangerous control sequences.
 - `strict_printable`: strips/escapes all control sequences.
 - `raw`: disables sanitizer (explicit opt-in).
 
