@@ -1,20 +1,14 @@
 # safepipe
 
-`safepipe` is a local-first, memory-safe CLI for deterministic text shaping in agent and shell pipelines.
+`safepipe` is a local-first, memory-safe CLI for safe text pipelines and shareable prompt templates.
 
-It is designed to be safe when used like:
+Primary workflow:
 
-```bash
-curl https://example.com/untrusted.txt | safepipe run --op trim --op collapse_whitespace
-```
+1. Trust one binary (`safepipe`).
+2. Share template files (`.spt`) from GitHub or local files.
+3. Let templates read local data in a constrained way and render terminal output safely.
 
-The binary does not execute subprocesses, does not load plugins, and does not evaluate code.
-
-## What It Does
-
-- Prompt-safe text shaping: normalize, wrap, redact, quote, truncate.
-- Terminal-safe formatting: allow safe style ANSI (balanced mode) while blocking control payloads.
-- Data munging: literal/regex replace, sorting, delimiter-aligned tables.
+The runtime does not execute shell commands, does not load plugins, and does not eval user code.
 
 ## Install
 
@@ -22,89 +16,108 @@ The binary does not execute subprocesses, does not load plugins, and does not ev
 cargo install --path crates/cli
 ```
 
-## Quick Start
+## Template DSL (Primary Use Case)
 
-### 1) Prompt-safe shaping
+A template can be local, installed, or fetched from a URL.
+
+Template syntax (v1):
+
+- `template v1`
+- `set terminal_policy = balanced|strict_printable|raw`
+- `set newline = preserve|ensure_trailing`
+- `source <name> = file("...") | <op> | <op> ...`
+- `source <name> = stdin() | <op> ...`
+- `source <name> = now("%Y-%m-%d %H:%M:%S %Z")`
+- `source <name> = literal("...")`
+- `emit """ ... {{name}} ... """`
+
+Example:
+
+```text
+template v1
+set terminal_policy = balanced
+set newline = ensure_trailing
+
+source now = now("%Y-%m-%d %H:%M:%S %Z")
+source profile = file("profile.txt") | trim:both
+source prompt = stdin() | trim:both | wrap:width=88
+
+emit """
+Current time: {{now}}
+
+Profile:
+{{profile}}
+
+User prompt:
+{{prompt}}
+"""
+```
+
+Run it:
 
 ```bash
-cat notes.txt | safepipe run \
-  --op normalize_unicode:nfkc \
-  --op collapse_whitespace:preserve_newlines=true \
-  --op wrap:width=88
+cat user.txt | safepipe template run --template ./template.spt --root .
 ```
 
-### 2) Terminal formatting with safe ANSI boundary
+### Sharing / Installing templates
 
 ```bash
-printf '\033[2J\033[31mhello\033[0m\n' | safepipe run --op trim
+# Install from GitHub raw URL
+safepipe template install \
+  --name daily_context \
+  --from https://raw.githubusercontent.com/ORG/REPO/main/templates/daily_context.spt
+
+# List installed templates
+safepipe template list
+
+# Show installed template
+safepipe template show --name daily_context
+
+# Run installed template
+cat input.txt | safepipe template run --template @daily_context --root .
 ```
 
-In default `balanced` mode, dangerous sequences (like clear-screen/cursor movement) are removed, while safe style SGR codes are preserved.
+## Transform Mode (Direct)
 
-### 3) Data munging
+You can still run direct transforms without templates:
 
 ```bash
-cat values.txt | safepipe run --op sort_lines:numeric=true,reverse=true --op truncate:max_chars=2000
+cat notes.txt | safepipe run --op trim:both --op collapse_whitespace:preserve_newlines=true
 ```
 
-## Spec Modes
+Supported interfaces:
 
-Two interfaces are supported in v1:
-
-- Repeated `--op` mini expressions.
-- JSON spec via `--spec` (inline JSON or `@path/to/spec.json`).
-
-`--op` mini expressions use:
-
-- `name:key=value,key2=value2`
-- or positional form `name:value1,value2`
-
-Examples:
-
-```bash
-safepipe run --op trim:both
-safepipe run --op wrap:width=80,break_long_words=false
-safepipe run --op redact:patterns=email|ipv4,replacement=[REDACTED]
-```
-
-Example JSON spec:
-
-```json
-{
-  "version": "v1",
-  "input": { "encoding": "utf8" },
-  "ops": [
-    { "op": "trim", "mode": "both" },
-    { "op": "redact", "patterns": ["email", "api_key_like"], "replacement": "[REDACTED]" },
-    { "op": "wrap", "width": 80, "break_long_words": false }
-  ],
-  "output": { "terminal_policy": "balanced", "newline": "ensure_trailing" }
-}
-```
-
-Then run:
-
-```bash
-cat input.txt | safepipe run --spec @spec.json
-```
+- repeated `--op` expressions
+- JSON `--spec` (inline or `@file`)
 
 ## Commands
 
-- `safepipe run`: execute transforms against stdin.
-- `safepipe validate --spec ...`: validate spec and semantics.
-- `safepipe explain --spec ...`: print normalized spec JSON.
+- `safepipe run`
+- `safepipe validate --spec ...`
+- `safepipe explain --spec ...`
+- `safepipe template run --template ... --root ...`
+- `safepipe template install --name ... --from ...`
+- `safepipe template list`
+- `safepipe template show --name ...`
+
+## Example Templates
+
+- `examples/system_context.spt`
+- `examples/stdin_prompt.spt`
 
 ## Exit Codes
 
 - `0`: success
-- `2`: spec/validation error
+- `2`: spec/template/validation error
 - `3`: limits exceeded or timeout
 - `4`: internal/runtime error
 
 ## Safety Notes
 
-- No shell execution, no eval, no dynamic extension loading.
-- Resource boundaries: max input bytes, max output bytes, max lines, optional timeout.
-- Terminal sanitizer is always applied unless output policy is `raw`.
+- No shell execution, eval, or dynamic extension loading.
+- Template `file(...)` reads are rooted by `--root` and must remain under that directory.
+- URL templates are treated as untrusted text and parsed declaratively.
+- Terminal sanitizer is applied unless output policy is `raw`.
+- Resource bounds: template bytes, source bytes, output bytes, line count, optional timeout.
 
 For details, see `SECURITY.md`.

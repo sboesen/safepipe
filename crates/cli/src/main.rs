@@ -1,13 +1,19 @@
+mod template_dsl;
+
+use chrono::Local;
 use clap::{Parser, Subcommand, ValueEnum};
 use safepipe_core::{run_pipeline, EngineError, EngineLimits};
 use safepipe_spec::{
-    parse_spec_from_str, validate_spec, ExtractMode, Op, PipelineSpec, QuoteStyle, RedactPattern,
-    TableAlign, TableDelimiter, TerminalPolicy, TrimMode, UnicodeForm,
+    parse_spec_from_str, validate_spec, ExtractMode, InputEncoding, InputOptions, NewlineMode, Op,
+    OutputOptions, PipelineSpec, QuoteStyle, RedactPattern, TableAlign, TableDelimiter,
+    TerminalPolicy, TrimMode, UnicodeForm,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use template_dsl::{SourceKind, TemplateScript};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -23,6 +29,7 @@ enum Commands {
     Run(RunCommand),
     Validate(ValidateCommand),
     Explain(ExplainCommand),
+    Template(TemplateCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -64,6 +71,69 @@ struct ExplainCommand {
     spec: String,
 }
 
+#[derive(Debug, Parser)]
+struct TemplateCommand {
+    #[command(subcommand)]
+    command: TemplateSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TemplateSubcommand {
+    Run(TemplateRunCommand),
+    Install(TemplateInstallCommand),
+    List,
+    Show(TemplateShowCommand),
+}
+
+#[derive(Debug, Parser)]
+struct TemplateRunCommand {
+    #[arg(long, help = "Template source: local path, URL, or @installed-name")]
+    template: String,
+
+    #[arg(
+        long,
+        default_value = ".",
+        help = "Root directory for template file() reads"
+    )]
+    root: PathBuf,
+
+    #[arg(long, default_value_t = 8 * 1024 * 1024, help = "Maximum bytes for each source read")]
+    max_source_bytes: usize,
+
+    #[arg(long, default_value_t = 128 * 1024, help = "Maximum template bytes to load")]
+    max_template_bytes: usize,
+
+    #[arg(long, default_value_t = 8 * 1024 * 1024, help = "Maximum output bytes after rendering")]
+    max_output_bytes: usize,
+
+    #[arg(long, default_value_t = 200_000, help = "Maximum output line count")]
+    max_lines: usize,
+
+    #[arg(long, help = "Optional timeout in milliseconds")]
+    timeout_ms: Option<u64>,
+
+    #[arg(long, value_enum, help = "Optional final terminal policy override")]
+    terminal_policy: Option<TerminalPolicyArg>,
+}
+
+#[derive(Debug, Parser)]
+struct TemplateInstallCommand {
+    #[arg(long, help = "Installed template name")]
+    name: String,
+
+    #[arg(long, help = "Template source: local path or URL")]
+    from: String,
+
+    #[arg(long, default_value_t = 128 * 1024, help = "Maximum template bytes to load")]
+    max_template_bytes: usize,
+}
+
+#[derive(Debug, Parser)]
+struct TemplateShowCommand {
+    #[arg(long, help = "Installed template name")]
+    name: String,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 #[value(rename_all = "snake_case")]
 enum TerminalPolicyArg {
@@ -86,6 +156,8 @@ impl From<TerminalPolicyArg> for TerminalPolicy {
 enum CliError {
     #[error("spec error: {0}")]
     Spec(String),
+    #[error("template error: {0}")]
+    Template(String),
     #[error("operation parse error: {0}")]
     OpParse(String),
     #[error("I/O error: {0}")]
@@ -101,7 +173,7 @@ enum CliError {
 impl CliError {
     fn exit_code(&self) -> i32 {
         match self {
-            CliError::Spec(_) | CliError::OpParse(_) => 2,
+            CliError::Spec(_) | CliError::Template(_) | CliError::OpParse(_) => 2,
             CliError::Limit(_) => 3,
             CliError::Engine(EngineError::LimitExceeded(_))
             | CliError::Engine(EngineError::Timeout) => 3,
@@ -124,6 +196,7 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
         Commands::Run(cmd) => run_command(cmd),
         Commands::Validate(cmd) => validate_command(cmd),
         Commands::Explain(cmd) => explain_command(cmd),
+        Commands::Template(cmd) => template_command(cmd),
     }
 }
 
@@ -176,6 +249,337 @@ fn explain_command(cmd: ExplainCommand) -> Result<(), CliError> {
         serde_json::to_string_pretty(&spec).map_err(|e| CliError::Internal(e.to_string()))?;
     println!("{normalized}");
     Ok(())
+}
+
+fn template_command(cmd: TemplateCommand) -> Result<(), CliError> {
+    match cmd.command {
+        TemplateSubcommand::Run(run) => template_run_command(run),
+        TemplateSubcommand::Install(install) => template_install_command(install),
+        TemplateSubcommand::List => template_list_command(),
+        TemplateSubcommand::Show(show) => template_show_command(show),
+    }
+}
+
+fn template_run_command(cmd: TemplateRunCommand) -> Result<(), CliError> {
+    let template_text = load_template_source(&cmd.template, cmd.max_template_bytes)?;
+    let script = template_dsl::parse_template(&template_text).map_err(CliError::Template)?;
+
+    let root = cmd.root.canonicalize().map_err(|e| {
+        CliError::Template(format!(
+            "failed to resolve root '{}': {e}",
+            cmd.root.display()
+        ))
+    })?;
+    if !root.is_dir() {
+        return Err(CliError::Template(format!(
+            "root path '{}' is not a directory",
+            root.display()
+        )));
+    }
+
+    let stdin_data = if script.has_stdin_source() {
+        Some(read_stdin_limited(cmd.max_source_bytes)?)
+    } else {
+        None
+    };
+
+    let limits = EngineLimits {
+        max_output_bytes: cmd.max_output_bytes,
+        max_lines: cmd.max_lines,
+        timeout: cmd.timeout_ms.map(Duration::from_millis),
+    };
+
+    let mut vars = HashMap::new();
+    for source in &script.sources {
+        let raw = load_source_bytes(source, &root, stdin_data.as_deref(), cmd.max_source_bytes)?;
+        let mut ops = Vec::with_capacity(source.ops.len());
+        for op_expr in &source.ops {
+            ops.push(parse_op_expr(op_expr)?);
+        }
+
+        let source_spec = PipelineSpec {
+            input: InputOptions {
+                encoding: InputEncoding::BytesLossy,
+            },
+            ops,
+            output: OutputOptions {
+                terminal_policy: TerminalPolicy::Raw,
+                newline: NewlineMode::Preserve,
+            },
+            ..PipelineSpec::default()
+        };
+
+        let transformed = run_pipeline(&raw, &source_spec, &limits)?;
+        vars.insert(source.name.clone(), transformed);
+    }
+
+    let rendered = template_dsl::render_body(&script.body, &vars).map_err(CliError::Template)?;
+    let final_output = render_template_output(
+        rendered.as_bytes(),
+        &script,
+        cmd.terminal_policy.map(Into::into),
+        &limits,
+    )?;
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(final_output.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn render_template_output(
+    rendered: &[u8],
+    script: &TemplateScript,
+    terminal_override: Option<TerminalPolicy>,
+    limits: &EngineLimits,
+) -> Result<String, CliError> {
+    let terminal_policy = match terminal_override {
+        Some(policy) => policy,
+        None => match script.terminal_policy.as_deref() {
+            Some(raw) => parse_terminal_policy_literal(raw)?,
+            None => TerminalPolicy::Balanced,
+        },
+    };
+
+    let newline = match script.newline.as_deref() {
+        Some(raw) => parse_newline_mode_literal(raw)?,
+        None => NewlineMode::Preserve,
+    };
+
+    let final_spec = PipelineSpec {
+        input: InputOptions {
+            encoding: InputEncoding::BytesLossy,
+        },
+        output: OutputOptions {
+            terminal_policy,
+            newline,
+        },
+        ..PipelineSpec::default()
+    };
+
+    run_pipeline(rendered, &final_spec, limits).map_err(CliError::from)
+}
+
+fn load_source_bytes(
+    source: &template_dsl::SourceDecl,
+    root: &Path,
+    stdin_data: Option<&[u8]>,
+    max_source_bytes: usize,
+) -> Result<Vec<u8>, CliError> {
+    match &source.kind {
+        SourceKind::File(path) => {
+            let resolved = resolve_safe_path(root, path)?;
+            read_file_bytes_limited(&resolved, max_source_bytes)
+        }
+        SourceKind::Stdin => Ok(stdin_data.unwrap_or_default().to_vec()),
+        SourceKind::Now(format) => Ok(Local::now().format(format).to_string().into_bytes()),
+        SourceKind::Literal(value) => Ok(value.as_bytes().to_vec()),
+    }
+}
+
+fn template_install_command(cmd: TemplateInstallCommand) -> Result<(), CliError> {
+    validate_template_name(&cmd.name)?;
+    if cmd.from.starts_with('@') {
+        return Err(CliError::Template(
+            "install source must be a local path or URL, not @installed-name".to_string(),
+        ));
+    }
+
+    let template_text = load_template_source(&cmd.from, cmd.max_template_bytes)?;
+    template_dsl::parse_template(&template_text).map_err(CliError::Template)?;
+
+    let dir = templates_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.spt", cmd.name));
+    fs::write(&path, template_text)?;
+    println!("installed {}", path.display());
+    Ok(())
+}
+
+fn template_list_command() -> Result<(), CliError> {
+    let dir = templates_dir()?;
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("spt") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            names.push(stem.to_string());
+        }
+    }
+
+    names.sort();
+    for name in names {
+        println!("{name}");
+    }
+    Ok(())
+}
+
+fn template_show_command(cmd: TemplateShowCommand) -> Result<(), CliError> {
+    validate_template_name(&cmd.name)?;
+    let content = load_installed_template(&cmd.name)?;
+    println!("{content}");
+    Ok(())
+}
+
+fn load_template_source(source: &str, max_bytes: usize) -> Result<String, CliError> {
+    if let Some(name) = source.strip_prefix('@') {
+        return load_installed_template(name);
+    }
+
+    if source.starts_with("http://") || source.starts_with("https://") {
+        return fetch_url_text(source, max_bytes);
+    }
+
+    read_file_string_limited(Path::new(source), max_bytes)
+}
+
+fn read_file_string_limited(path: &Path, max_bytes: usize) -> Result<String, CliError> {
+    let bytes = read_file_bytes_limited(path, max_bytes)?;
+    String::from_utf8(bytes).map_err(|_| {
+        CliError::Template(format!(
+            "template file '{}' is not valid UTF-8",
+            path.display()
+        ))
+    })
+}
+
+fn fetch_url_text(url: &str, max_bytes: usize) -> Result<String, CliError> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| CliError::Internal(format!("failed to build HTTP client: {e}")))?;
+
+    let mut response = client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|e| CliError::Internal(format!("failed to fetch template URL: {e}")))?;
+
+    let bytes = read_to_end_limited(&mut response, max_bytes, "template response")?;
+    String::from_utf8(bytes)
+        .map_err(|_| CliError::Template(format!("template URL '{url}' returned non-UTF-8 content")))
+}
+
+fn templates_dir() -> Result<PathBuf, CliError> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| CliError::Internal("could not resolve home directory".to_string()))?;
+    Ok(home.join(".safepipe").join("templates"))
+}
+
+fn load_installed_template(name: &str) -> Result<String, CliError> {
+    validate_template_name(name)?;
+    let path = templates_dir()?.join(format!("{name}.spt"));
+    fs::read_to_string(&path)
+        .map_err(|e| CliError::Template(format!("failed to read installed template '{name}': {e}")))
+}
+
+fn validate_template_name(name: &str) -> Result<(), CliError> {
+    if name.is_empty() {
+        return Err(CliError::Template(
+            "template name cannot be empty".to_string(),
+        ));
+    }
+
+    let mut chars = name.chars();
+    let first = chars.next().expect("checked non-empty");
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(CliError::Template(format!(
+            "invalid template name '{name}': must start with [A-Za-z_]"
+        )));
+    }
+
+    if !chars.all(|c| c == '_' || c.is_ascii_alphanumeric() || c == '-') {
+        return Err(CliError::Template(format!(
+            "invalid template name '{name}': only [A-Za-z0-9_-] allowed"
+        )));
+    }
+
+    Ok(())
+}
+
+fn resolve_safe_path(root: &Path, relative: &str) -> Result<PathBuf, CliError> {
+    let rel = Path::new(relative);
+    if rel.is_absolute() {
+        return Err(CliError::Template(format!(
+            "absolute paths are not allowed in template file(): '{}'",
+            rel.display()
+        )));
+    }
+
+    let full = root.join(rel);
+    let canonical = full.canonicalize().map_err(|e| {
+        CliError::Template(format!(
+            "failed to resolve template file '{}': {e}",
+            full.display()
+        ))
+    })?;
+
+    if !canonical.starts_with(root) {
+        return Err(CliError::Template(format!(
+            "template file path '{}' escapes root '{}'",
+            canonical.display(),
+            root.display()
+        )));
+    }
+
+    Ok(canonical)
+}
+
+fn read_file_bytes_limited(path: &Path, max_bytes: usize) -> Result<Vec<u8>, CliError> {
+    let mut file = fs::File::open(path)?;
+    read_to_end_limited(&mut file, max_bytes, &format!("file '{}'", path.display()))
+}
+
+fn read_to_end_limited<R: Read>(
+    reader: &mut R,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, CliError> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+
+        if out.len() + read > max_bytes {
+            return Err(CliError::Limit(format!(
+                "{label} exceeded maximum of {max_bytes} bytes"
+            )));
+        }
+
+        out.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(out)
+}
+
+fn parse_terminal_policy_literal(raw: &str) -> Result<TerminalPolicy, CliError> {
+    match normalize_key(raw).as_str() {
+        "balanced" => Ok(TerminalPolicy::Balanced),
+        "strict_printable" => Ok(TerminalPolicy::StrictPrintable),
+        "raw" => Ok(TerminalPolicy::Raw),
+        _ => Err(CliError::Template(format!(
+            "invalid terminal_policy '{raw}'"
+        ))),
+    }
+}
+
+fn parse_newline_mode_literal(raw: &str) -> Result<NewlineMode, CliError> {
+    match normalize_key(raw).as_str() {
+        "preserve" => Ok(NewlineMode::Preserve),
+        "ensure_trailing" => Ok(NewlineMode::EnsureTrailing),
+        _ => Err(CliError::Template(format!("invalid newline mode '{raw}'"))),
+    }
 }
 
 fn load_base_spec(spec_arg: Option<&str>) -> Result<PipelineSpec, CliError> {

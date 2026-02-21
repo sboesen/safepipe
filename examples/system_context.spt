@@ -1,0 +1,17 @@
+template v1
+set terminal_policy = balanced
+set newline = ensure_trailing
+
+source now = now("%Y-%m-%d %H:%M:%S %Z")
+source rules = file("rules/agent_rules.md") | trim:both
+source notes = file("notes/today.txt") | trim:both | truncate:max_chars=2000
+
+emit """
+You are operating at {{now}}.
+
+Policy:
+{{rules}}
+
+Today's notes:
+{{notes}}
+"""

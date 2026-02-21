@@ -1,0 +1,10 @@
+template v1
+set terminal_policy = balanced
+
+source chunk = stdin() | trim:both | wrap:width=88
+
+emit """
+Summarize the following safely-normalized input:
+
+{{chunk}}
+"""
