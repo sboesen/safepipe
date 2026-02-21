@@ -30,10 +30,13 @@ Non-goals:
 - Rust implementation (memory-safe by default).
 - Declarative template and transform model (no executable user code).
 - No subprocess execution in runtime pipeline.
+- `run` mode terminal policy is caller-controlled; untrusted spec policy is ignored.
 - URL templates are fetched as text only, then parsed by DSL parser.
+- URL defaults are hardened: HTTPS-only, redirects blocked, private/local hosts blocked unless explicit override.
+- Optional template integrity pin with `--template-sha256`.
 - Template `set ...` directives are rejected.
 - Runtime safety policy is caller-selected via CLI flags.
-- `file("...")` is rooted under `--root` and path escape is blocked.
+- `file("...")` is rooted under `--root`, path escape is blocked, and optional `--allow-read` can narrow capabilities.
 - Source/template/output size limits are enforced.
 
 ## Output Safety Modes

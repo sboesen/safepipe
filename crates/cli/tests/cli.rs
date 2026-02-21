@@ -1,4 +1,6 @@
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tempfile::tempdir;
@@ -67,6 +69,21 @@ fn validate_spec_command() {
 fn balanced_mode_strips_dangerous_escape_sequences() {
     let output = run_safepipe(&["run"], b"\x1b[2Jsafe");
     assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "safe");
+}
+
+#[test]
+fn untrusted_spec_cannot_force_raw_terminal_policy() {
+    let output = run_safepipe(
+        &[
+            "run",
+            "--spec",
+            r#"{"version":"v1","output":{"terminal_policy":"raw"},"ops":[]}"#,
+        ],
+        b"\x1b[2Jsafe",
+    );
+    assert!(output.status.success());
+    // run mode policy is CLI-owned; untrusted spec output policy is ignored.
     assert_eq!(String::from_utf8_lossy(&output.stdout), "safe");
 }
 
@@ -226,4 +243,235 @@ fn safe_awk_like_select_and_filter_ops_work() {
         String::from_utf8_lossy(&output.stdout),
         "bob|ops\ncharlie|ops\n"
     );
+}
+
+#[test]
+fn template_allow_read_blocks_non_allowlisted_file() {
+    let dir = tempdir().expect("tempdir should be created");
+    let template_path = dir.path().join("example.spt");
+    let allowed_path = dir.path().join("allowed.txt");
+    let blocked_path = dir.path().join("blocked.txt");
+
+    std::fs::write(&allowed_path, "safe").expect("should write allowed file");
+    std::fs::write(&blocked_path, "secret").expect("should write blocked file");
+    std::fs::write(
+        &template_path,
+        r#"
+template v1
+source blocked = file("blocked.txt")
+emit """
+{{blocked}}
+"""
+"#,
+    )
+    .expect("should write template file");
+
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            template_path.to_str().expect("valid path"),
+            "--root",
+            dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+            "--allow-read",
+            "allowed.txt",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not allowed by --allow-read policy"));
+}
+
+#[test]
+fn template_allow_read_dot_allows_root_scoped_reads() {
+    let dir = tempdir().expect("tempdir should be created");
+    let template_path = dir.path().join("example.spt");
+    let blocked_path = dir.path().join("blocked.txt");
+
+    std::fs::write(&blocked_path, "secret").expect("should write blocked file");
+    std::fs::write(
+        &template_path,
+        r#"
+template v1
+source blocked = file("blocked.txt")
+emit """
+{{blocked}}
+"""
+"#,
+    )
+    .expect("should write template file");
+
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            template_path.to_str().expect("valid path"),
+            "--root",
+            dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+            "--allow-read",
+            ".",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "secret");
+}
+
+#[test]
+fn template_sha256_mismatch_fails_closed() {
+    let dir = tempdir().expect("tempdir should be created");
+    let template_path = dir.path().join("example.spt");
+    std::fs::write(
+        &template_path,
+        r#"
+template v1
+source name = literal("agent")
+emit """
+{{name}}
+"""
+"#,
+    )
+    .expect("should write template file");
+
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            template_path.to_str().expect("valid path"),
+            "--root",
+            dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+            "--template-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("template SHA-256 mismatch"));
+}
+
+#[test]
+fn installed_template_with_file_requires_allow_read() {
+    let home = tempdir().expect("temp home should be created");
+    let work = tempdir().expect("temp work dir should be created");
+    let source_template = work.path().join("source.spt");
+    let data_path = work.path().join("data.txt");
+
+    std::fs::write(&data_path, "secret").expect("should write data file");
+    std::fs::write(
+        &source_template,
+        r#"
+template v1
+source data = file("data.txt")
+emit """
+{{data}}
+"""
+"#,
+    )
+    .expect("should write source template");
+
+    let home_path = home.path().to_str().expect("valid home path");
+    let source_path = source_template.to_str().expect("valid source path");
+
+    let install = run_safepipe_with(
+        &[
+            "template",
+            "install",
+            "--name",
+            "needs_allowlist",
+            "--from",
+            source_path,
+        ],
+        b"",
+        Some(work.path()),
+        &[("HOME", home_path)],
+    );
+    assert!(
+        install.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let run = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            "@needs_allowlist",
+            "--root",
+            work.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+        ],
+        b"",
+        Some(work.path()),
+        &[("HOME", home_path)],
+    );
+    assert!(!run.status.success());
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("require explicit --allow-read entries"));
+}
+
+#[cfg(unix)]
+#[test]
+fn template_rejects_symlink_components() {
+    let dir = tempdir().expect("tempdir should be created");
+    let template_path = dir.path().join("example.spt");
+    let real_path = dir.path().join("real.txt");
+    let link_path = dir.path().join("link.txt");
+
+    std::fs::write(&real_path, "secret").expect("should write real file");
+    symlink(&real_path, &link_path).expect("should create symlink");
+    std::fs::write(
+        &template_path,
+        r#"
+template v1
+source data = file("link.txt")
+emit """
+{{data}}
+"""
+"#,
+    )
+    .expect("should write template file");
+
+    let output = run_safepipe_with(
+        &[
+            "template",
+            "run",
+            "--template",
+            template_path.to_str().expect("valid path"),
+            "--root",
+            dir.path().to_str().expect("valid path"),
+            "--terminal-policy",
+            "strict_printable",
+            "--allow-read",
+            ".",
+        ],
+        b"",
+        Some(dir.path()),
+        &[],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot include symlink components"));
 }

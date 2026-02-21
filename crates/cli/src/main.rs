@@ -8,10 +8,12 @@ use safepipe_spec::{
     OutputOptions, PipelineSpec, QuoteStyle, RedactPattern, TableAlign, TableDelimiter,
     TerminalPolicy, TrimMode, UnicodeForm,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, ToSocketAddrs};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use template_dsl::SourceKind;
 use thiserror::Error;
@@ -52,8 +54,13 @@ struct RunCommand {
     #[arg(long, help = "Optional timeout in milliseconds")]
     timeout_ms: Option<u64>,
 
-    #[arg(long, value_enum, help = "Output terminal policy override")]
-    terminal_policy: Option<TerminalPolicyArg>,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = TerminalPolicyArg::Balanced,
+        help = "Caller-selected terminal policy (spec value is ignored)"
+    )]
+    terminal_policy: TerminalPolicyArg,
 
     #[arg(long, help = "No-op compatibility flag; balanced policy is default")]
     allow_style: bool,
@@ -126,6 +133,27 @@ struct TemplateRunCommand {
         help = "Newline mode applied after render"
     )]
     newline: NewlineModeArg,
+
+    #[arg(
+        long,
+        help = "Optional SHA-256 hex digest for template bytes (64 hex chars)"
+    )]
+    template_sha256: Option<String>,
+
+    #[arg(long, help = "Allow HTTP template URLs (HTTPS is default/required)")]
+    allow_insecure_http: bool,
+
+    #[arg(
+        long,
+        help = "Allow template URL hosts that resolve to private/localhost IPs"
+    )]
+    allow_private_hosts: bool,
+
+    #[arg(
+        long = "allow-read",
+        help = "Limit template file() reads to these root-relative paths (repeatable)"
+    )]
+    allow_read: Vec<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -138,6 +166,21 @@ struct TemplateInstallCommand {
 
     #[arg(long, default_value_t = 128 * 1024, help = "Maximum template bytes to load")]
     max_template_bytes: usize,
+
+    #[arg(
+        long,
+        help = "Optional SHA-256 hex digest for template bytes (64 hex chars)"
+    )]
+    template_sha256: Option<String>,
+
+    #[arg(long, help = "Allow HTTP template URLs (HTTPS is default/required)")]
+    allow_insecure_http: bool,
+
+    #[arg(
+        long,
+        help = "Allow template URL hosts that resolve to private/localhost IPs"
+    )]
+    allow_private_hosts: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -169,6 +212,34 @@ impl From<TerminalPolicyArg> for TerminalPolicy {
 enum NewlineModeArg {
     Preserve,
     EnsureTrailing,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TemplateFetchPolicy {
+    allow_insecure_http: bool,
+    allow_private_hosts: bool,
+    expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TemplateReadPolicy {
+    allowed_paths: Vec<PathBuf>,
+}
+
+impl TemplateReadPolicy {
+    fn new(allowed_paths: Vec<PathBuf>) -> Self {
+        Self { allowed_paths }
+    }
+
+    fn allows(&self, path: &Path) -> bool {
+        if self.allowed_paths.is_empty() {
+            return true;
+        }
+
+        self.allowed_paths
+            .iter()
+            .any(|allowed| path == allowed || path.starts_with(allowed))
+    }
 }
 
 impl From<NewlineModeArg> for NewlineMode {
@@ -235,9 +306,8 @@ fn run_command(cmd: RunCommand) -> Result<(), CliError> {
         spec.ops.push(parse_op_expr(op_expr)?);
     }
 
-    if let Some(policy) = cmd.terminal_policy {
-        spec.output.terminal_policy = policy.into();
-    }
+    // Runtime safety comes from CLI flags, not untrusted spec text.
+    spec.output.terminal_policy = cmd.terminal_policy.into();
 
     if cmd.allow_style && matches!(spec.output.terminal_policy, TerminalPolicy::StrictPrintable) {
         // User explicitly requested strict_printable; do not override.
@@ -289,7 +359,12 @@ fn template_command(cmd: TemplateCommand) -> Result<(), CliError> {
 }
 
 fn template_run_command(cmd: TemplateRunCommand) -> Result<(), CliError> {
-    let template_text = load_template_source(&cmd.template, cmd.max_template_bytes)?;
+    let fetch_policy = build_template_fetch_policy(
+        cmd.allow_insecure_http,
+        cmd.allow_private_hosts,
+        cmd.template_sha256.as_deref(),
+    )?;
+    let template_text = load_template_source(&cmd.template, cmd.max_template_bytes, &fetch_policy)?;
     let script = template_dsl::parse_template(&template_text).map_err(CliError::Template)?;
 
     let root = cmd.root.canonicalize().map_err(|e| {
@@ -305,6 +380,20 @@ fn template_run_command(cmd: TemplateRunCommand) -> Result<(), CliError> {
         )));
     }
 
+    if template_source_requires_explicit_allow_read(&cmd.template)
+        && script
+            .sources
+            .iter()
+            .any(|source| matches!(source.kind, SourceKind::File(_)))
+        && cmd.allow_read.is_empty()
+    {
+        return Err(CliError::Template(
+            "templates from URL or @installed source using file() require explicit --allow-read entries".to_string(),
+        ));
+    }
+
+    let read_policy = build_template_read_policy(&root, &cmd.allow_read)?;
+
     let stdin_data = if script.has_stdin_source() {
         Some(read_stdin_limited(cmd.max_source_bytes)?)
     } else {
@@ -319,7 +408,13 @@ fn template_run_command(cmd: TemplateRunCommand) -> Result<(), CliError> {
 
     let mut vars = HashMap::new();
     for source in &script.sources {
-        let raw = load_source_bytes(source, &root, stdin_data.as_deref(), cmd.max_source_bytes)?;
+        let raw = load_source_bytes(
+            source,
+            &root,
+            &read_policy,
+            stdin_data.as_deref(),
+            cmd.max_source_bytes,
+        )?;
         let mut ops = Vec::with_capacity(source.ops.len());
         for op_expr in &source.ops {
             ops.push(parse_op_expr(op_expr)?);
@@ -378,13 +473,18 @@ fn render_template_output(
 fn load_source_bytes(
     source: &template_dsl::SourceDecl,
     root: &Path,
+    read_policy: &TemplateReadPolicy,
     stdin_data: Option<&[u8]>,
     max_source_bytes: usize,
 ) -> Result<Vec<u8>, CliError> {
     match &source.kind {
         SourceKind::File(path) => {
-            let resolved = resolve_safe_path(root, path)?;
-            read_file_bytes_limited(&resolved, max_source_bytes)
+            let (mut file, resolved) = open_safe_template_file(root, read_policy, path)?;
+            read_to_end_limited(
+                &mut file,
+                max_source_bytes,
+                &format!("file '{}'", resolved.display()),
+            )
         }
         SourceKind::Stdin => Ok(stdin_data.unwrap_or_default().to_vec()),
         SourceKind::Now(format) => Ok(Local::now().format(format).to_string().into_bytes()),
@@ -400,7 +500,12 @@ fn template_install_command(cmd: TemplateInstallCommand) -> Result<(), CliError>
         ));
     }
 
-    let template_text = load_template_source(&cmd.from, cmd.max_template_bytes)?;
+    let fetch_policy = build_template_fetch_policy(
+        cmd.allow_insecure_http,
+        cmd.allow_private_hosts,
+        cmd.template_sha256.as_deref(),
+    )?;
+    let template_text = load_template_source(&cmd.from, cmd.max_template_bytes, &fetch_policy)?;
     template_dsl::parse_template(&template_text).map_err(CliError::Template)?;
 
     let dir = templates_dir()?;
@@ -443,16 +548,82 @@ fn template_show_command(cmd: TemplateShowCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn load_template_source(source: &str, max_bytes: usize) -> Result<String, CliError> {
-    if let Some(name) = source.strip_prefix('@') {
-        return load_installed_template(name);
+fn build_template_fetch_policy(
+    allow_insecure_http: bool,
+    allow_private_hosts: bool,
+    template_sha256: Option<&str>,
+) -> Result<TemplateFetchPolicy, CliError> {
+    let expected_sha256 = template_sha256.map(parse_sha256_hex).transpose()?;
+    Ok(TemplateFetchPolicy {
+        allow_insecure_http,
+        allow_private_hosts,
+        expected_sha256,
+    })
+}
+
+fn parse_sha256_hex(raw: &str) -> Result<String, CliError> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.len() != 64 || !normalized.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(CliError::Template(
+            "template SHA-256 must be exactly 64 hexadecimal characters".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn verify_template_sha256(
+    template_bytes: &[u8],
+    source: &str,
+    expected_sha256: Option<&str>,
+) -> Result<(), CliError> {
+    let Some(expected) = expected_sha256 else {
+        return Ok(());
+    };
+
+    let digest = Sha256::digest(template_bytes);
+    let mut actual = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut actual, "{byte:02x}")
+            .map_err(|e| CliError::Internal(format!("failed to render SHA-256 digest: {e}")))?;
     }
 
-    if source.starts_with("http://") || source.starts_with("https://") {
-        return fetch_url_text(source, max_bytes);
+    if actual != expected {
+        return Err(CliError::Template(format!(
+            "template SHA-256 mismatch for '{source}' (expected {expected}, got {actual})"
+        )));
     }
 
-    read_file_string_limited(Path::new(source), max_bytes)
+    Ok(())
+}
+
+fn load_template_source(
+    source: &str,
+    max_bytes: usize,
+    fetch_policy: &TemplateFetchPolicy,
+) -> Result<String, CliError> {
+    let text = if let Some(name) = source.strip_prefix('@') {
+        load_installed_template(name)?
+    } else if is_remote_template_source(source) {
+        fetch_url_text(source, max_bytes, fetch_policy)?
+    } else {
+        read_file_string_limited(Path::new(source), max_bytes)?
+    };
+
+    verify_template_sha256(
+        text.as_bytes(),
+        source,
+        fetch_policy.expected_sha256.as_deref(),
+    )?;
+    Ok(text)
+}
+
+fn is_remote_template_source(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
+fn template_source_requires_explicit_allow_read(source: &str) -> bool {
+    is_remote_template_source(source) || source.starts_with('@')
 }
 
 fn read_file_string_limited(path: &Path, max_bytes: usize) -> Result<String, CliError> {
@@ -465,21 +636,124 @@ fn read_file_string_limited(path: &Path, max_bytes: usize) -> Result<String, Cli
     })
 }
 
-fn fetch_url_text(url: &str, max_bytes: usize) -> Result<String, CliError> {
+fn fetch_url_text(
+    url: &str,
+    max_bytes: usize,
+    fetch_policy: &TemplateFetchPolicy,
+) -> Result<String, CliError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| CliError::Template(format!("invalid template URL '{url}': {e}")))?;
+    validate_template_url(&parsed, fetch_policy)?;
+
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| CliError::Internal(format!("failed to build HTTP client: {e}")))?;
 
-    let mut response = client
+    let response = client
         .get(url)
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|e| CliError::Internal(format!("failed to fetch template URL: {e}")))?;
+    if response.status().is_redirection() {
+        return Err(CliError::Template(
+            "template URL redirects are blocked; use a direct URL".to_string(),
+        ));
+    }
+    let mut response = response
+        .error_for_status()
         .map_err(|e| CliError::Internal(format!("failed to fetch template URL: {e}")))?;
 
     let bytes = read_to_end_limited(&mut response, max_bytes, "template response")?;
     String::from_utf8(bytes)
         .map_err(|_| CliError::Template(format!("template URL '{url}' returned non-UTF-8 content")))
+}
+
+fn validate_template_url(
+    url: &reqwest::Url,
+    fetch_policy: &TemplateFetchPolicy,
+) -> Result<(), CliError> {
+    match url.scheme() {
+        "https" => {}
+        "http" if fetch_policy.allow_insecure_http => {}
+        "http" => {
+            return Err(CliError::Template(
+                "refusing insecure HTTP template URL; pass --allow-insecure-http to override"
+                    .to_string(),
+            ));
+        }
+        other => {
+            return Err(CliError::Template(format!(
+                "unsupported template URL scheme '{other}'; use https://"
+            )));
+        }
+    }
+
+    if fetch_policy.allow_private_hosts {
+        return Ok(());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| CliError::Template("template URL is missing host".to_string()))?;
+
+    if is_local_hostname(host) {
+        return Err(CliError::Template(format!(
+            "template URL host '{host}' is private/local; pass --allow-private-hosts to override"
+        )));
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(CliError::Template(format!(
+                "template URL IP '{ip}' is private/local; pass --allow-private-hosts to override"
+            )));
+        }
+        return Ok(());
+    }
+
+    let Some(port) = url.port_or_known_default() else {
+        return Ok(());
+    };
+
+    if let Ok(addrs) = (host, port).to_socket_addrs() {
+        for addr in addrs {
+            let ip = addr.ip();
+            if is_private_ip(ip) {
+                return Err(CliError::Template(format!(
+                    "template URL host '{host}' resolved to private/local IP '{ip}'; pass --allow-private-hosts to override"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_local_hostname(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+        || host.eq_ignore_ascii_case("local")
+}
+
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+        }
+    }
 }
 
 fn templates_dir() -> Result<PathBuf, CliError> {
@@ -519,16 +793,87 @@ fn validate_template_name(name: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn resolve_safe_path(root: &Path, relative: &str) -> Result<PathBuf, CliError> {
-    let rel = Path::new(relative);
+fn build_template_read_policy(
+    root: &Path,
+    allow_read: &[String],
+) -> Result<TemplateReadPolicy, CliError> {
+    let mut allowed_paths = Vec::new();
+    for raw in allow_read {
+        let normalized = normalize_template_relative_path(raw, true)?;
+        ensure_no_symlink_components(root, &normalized, "--allow-read path")?;
+        let full = if normalized.as_os_str().is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(normalized)
+        };
+
+        let canonical = full.canonicalize().map_err(|e| {
+            CliError::Template(format!(
+                "failed to resolve --allow-read path '{}': {e}",
+                full.display()
+            ))
+        })?;
+        if !canonical.starts_with(root) {
+            return Err(CliError::Template(format!(
+                "--allow-read path '{}' escapes root '{}'",
+                canonical.display(),
+                root.display()
+            )));
+        }
+        allowed_paths.push(canonical);
+    }
+    Ok(TemplateReadPolicy::new(allowed_paths))
+}
+
+fn normalize_template_relative_path(
+    raw: &str,
+    allow_root_alias: bool,
+) -> Result<PathBuf, CliError> {
+    let rel = Path::new(raw);
     if rel.is_absolute() {
         return Err(CliError::Template(format!(
-            "absolute paths are not allowed in template file(): '{}'",
+            "absolute paths are not allowed in template file access: '{}'",
             rel.display()
         )));
     }
 
-    let full = root.join(rel);
+    let mut normalized = PathBuf::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(CliError::Template(format!(
+                    "parent path segments are not allowed in template file access: '{}'",
+                    rel.display()
+                )));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(CliError::Template(format!(
+                    "invalid template file path '{}'",
+                    rel.display()
+                )));
+            }
+        }
+    }
+
+    if !allow_root_alias && normalized.as_os_str().is_empty() {
+        return Err(CliError::Template(
+            "template file path cannot be empty".to_string(),
+        ));
+    }
+
+    Ok(normalized)
+}
+
+fn open_safe_template_file(
+    root: &Path,
+    read_policy: &TemplateReadPolicy,
+    relative: &str,
+) -> Result<(fs::File, PathBuf), CliError> {
+    let normalized = normalize_template_relative_path(relative, false)?;
+    ensure_no_symlink_components(root, &normalized, "template file path")?;
+    let full = root.join(&normalized);
     let canonical = full.canonicalize().map_err(|e| {
         CliError::Template(format!(
             "failed to resolve template file '{}': {e}",
@@ -543,8 +888,68 @@ fn resolve_safe_path(root: &Path, relative: &str) -> Result<PathBuf, CliError> {
             root.display()
         )));
     }
+    if !read_policy.allows(&canonical) {
+        return Err(CliError::Template(format!(
+            "template file '{}' is not allowed by --allow-read policy",
+            canonical.display()
+        )));
+    }
 
-    Ok(canonical)
+    let file = open_file_read_only_no_symlink(&canonical)?;
+    Ok((file, canonical))
+}
+
+fn ensure_no_symlink_components(root: &Path, relative: &Path, label: &str) -> Result<(), CliError> {
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        if let Component::Normal(part) = component {
+            cursor.push(part);
+            let meta = fs::symlink_metadata(&cursor).map_err(|e| {
+                CliError::Template(format!(
+                    "failed to resolve {label} '{}': {e}",
+                    cursor.display()
+                ))
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(CliError::Template(format!(
+                    "{label} '{}' cannot include symlink components",
+                    cursor.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_file_read_only_no_symlink(path: &Path) -> Result<fs::File, CliError> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+
+    // Best-effort race detection: ensure opened inode still matches current path target.
+    let file_meta = file.metadata()?;
+    let path_meta = fs::metadata(path)?;
+    if file_meta.dev() != path_meta.dev() || file_meta.ino() != path_meta.ino() {
+        return Err(CliError::Template(format!(
+            "detected concurrent path swap while opening '{}'",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_file_read_only_no_symlink(path: &Path) -> Result<fs::File, CliError> {
+    fs::File::open(path).map_err(CliError::from)
 }
 
 fn read_file_bytes_limited(path: &Path, max_bytes: usize) -> Result<Vec<u8>, CliError> {

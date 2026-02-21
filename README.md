@@ -19,8 +19,12 @@ Enforced properties:
 - no eval
 - no plugin loading
 - template cannot set runtime terminal policy
+- `run` terminal policy is caller-selected; untrusted spec policy is ignored
 - caller must pass `--terminal-policy` for `template run`
 - `file("...")` reads are rooted under `--root` and blocked on path escape
+- optional `--allow-read` capability fence for `file(...)` paths
+- template URL defaults: HTTPS-only, no redirects, private-host block (override flags exist)
+- optional template content pinning via `--template-sha256`
 - runtime bounds on template/source/output bytes and output lines
 - optional timeout
 
@@ -57,7 +61,7 @@ safepipe template show --name <NAME>
 - `--max-output-bytes <N>` output byte cap (default `8388608`)
 - `--max-lines <N>` output line cap (default `200000`)
 - `--timeout-ms <N>` optional timeout
-- `--terminal-policy <balanced|strict_printable|raw>`
+- `--terminal-policy <balanced|strict_printable|raw>` caller policy (spec value ignored)
 - `--allow-style` compatibility no-op
 
 ### 3.2 `template run` options
@@ -71,6 +75,20 @@ safepipe template show --name <NAME>
 - `--timeout-ms <N>` optional timeout
 - `--terminal-policy <balanced|strict_printable|raw>` required
 - `--newline <preserve|ensure_trailing>` default `preserve`
+- `--template-sha256 <HEX64>` optional template integrity pin
+- `--allow-insecure-http` allow `http://` template URLs
+- `--allow-private-hosts` allow localhost/private IP template hosts
+- `--allow-read <REL_PATH>` repeatable file read allowlist under `--root` (`.` means whole root)
+  - required when template source is URL or `@installed` and template uses `file(...)`.
+
+### 3.3 `template install` options
+
+- `--name <NAME>`
+- `--from <PATH_OR_URL>`
+- `--max-template-bytes <N>`
+- `--template-sha256 <HEX64>` optional template integrity pin
+- `--allow-insecure-http` allow `http://` template URLs
+- `--allow-private-hosts` allow localhost/private IP template hosts
 
 ## 4) Terminal Policies
 
@@ -260,13 +278,15 @@ echo '   hello   world   ' \
 cat input.txt | safepipe template run \
   --template https://raw.githubusercontent.com/ORG/REPO/main/template.spt \
   --root . \
+  --allow-read prompts/profile.txt \
+  --template-sha256 <HEX64> \
   --terminal-policy strict_printable
 ```
 
 ### 9.3 install + run template
 
 ```bash
-safepipe template install --name daily_context --from https://raw.githubusercontent.com/ORG/REPO/main/daily_context.spt
+safepipe template install --name daily_context --from https://raw.githubusercontent.com/ORG/REPO/main/daily_context.spt --template-sha256 <HEX64>
 cat input.txt | safepipe template run --template @daily_context --root . --terminal-policy strict_printable
 ```
 
@@ -319,8 +339,10 @@ echo '  summarize this safely  ' | safepipe template run --template ./file_and_s
 
 1. pin `--terminal-policy strict_printable` unless raw output is explicitly needed.
 2. set conservative bounds (`--max-source-bytes`, `--max-output-bytes`).
-3. keep template source untrusted; never assume it can change runtime safety.
-4. consume stdout only.
+3. for remote templates, pin `--template-sha256` and keep HTTPS.
+4. for URL/`@installed` templates using `file(...)`, provide minimal `--allow-read` scope.
+5. keep template source untrusted; never assume it can change runtime safety.
+6. consume stdout only.
 
 ## 11) Failure Hints
 
@@ -328,6 +350,10 @@ echo '  summarize this safely  ' | safepipe template run --template ./file_and_s
 - `required arguments were not provided: --terminal-policy`: policy must be caller-chosen.
 - `absolute paths are not allowed`: `file(...)` used absolute path.
 - `escapes root`: `file(...)` path traversal blocked.
+- `not allowed by --allow-read policy`: `file(...)` outside declared capability.
+- `refusing insecure HTTP template URL`: pass `--allow-insecure-http` if truly needed.
+- `is private/local`: host blocked unless `--allow-private-hosts`.
+- `template SHA-256 mismatch`: fetched bytes != `--template-sha256`.
 - `missing placeholder value`: placeholder has no source.
 - `unknown op '3'` in template: `|` inside op args split pipeline; use `fields=1;3;4`.
 
